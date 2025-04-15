@@ -23,7 +23,7 @@ if not openai_api_key:
 client = OpenAI(api_key=openai_api_key)
 
 # ------------------- Configuration -------------------
-SEARCH_MODEL          = "gpt-4o-search-preview"  # Search‑enabled model
+SEARCH_MODEL          = "gpt-4.1-nano"           # Model for search and proposal
 SYNTHESIS_MODEL       = "gpt-4.1-nano"           # Final synthesis model (32k window)
 TARGET_CONTEXT_TOKENS = 1_000_000                # Theoretical token budget
 STOP_AT_RATIO         = 0.8                      # Stop when ~80% is reached
@@ -41,26 +41,49 @@ def n_tokens(text: str) -> int:
 # ------------------- Function Definitions -------------------
 def call_search_model(prompt: str) -> Dict:
     """
-    Calls the search‑enabled model with the given prompt.
+    Calls the specified model with the given prompt and web search tool.
     Returns a dictionary with the assistant's text and a list of citations.
     """
-    response = client.responses.create(
+    response = client.chat.completions.create(
         model=SEARCH_MODEL,
+        messages=[{"role": "user", "content": prompt}],
         tools=[{
             "type": "web_search_preview",
             "search_context_size": "medium"
         }],
-        input=prompt,
-        max_tokens=2048,
+        tool_choice="required", # Ensure the tool is used
         temperature=0.3,
+        max_tokens=2048 # max_tokens is valid for chat completions
     )
-    # Extract the assistant’s message block from the response
-    message_item = next(item for item in response if item["type"] == "message")
-    text_content = message_item["content"][0]["text"]
-    citations = [
-        a for a in message_item["content"][0]["annotations"]
-        if a["type"] == "url_citation"
-    ]
+    time.sleep(21) # Add delay for rate limiting (approx. 3 RPM)
+    # Extract the assistant’s message
+    message = response.choices[0].message
+
+    # Check if content is None (might happen if only tool calls are present initially)
+    # In practice with search, the model usually summarizes findings in content.
+    text_content = ""
+    citations = []
+    if message.content:
+        # Assuming content is structured similarly with text and annotations
+        # This might need adjustment based on actual API response structure with tools
+        # Check if content is a list (like in the original response structure)
+        if isinstance(message.content, list) and len(message.content) > 0:
+             # Find the text part
+             text_part = next((item for item in message.content if item.type == "text"), None)
+             if text_part:
+                 text_content = text_part.text
+                 # Extract annotations if they exist within the text part
+                 if hasattr(text_part, 'annotations'):
+                      citations = [
+                          a for a in text_part.annotations
+                          if hasattr(a, 'type') and a.type == "url_citation"
+                      ]
+        elif isinstance(message.content, str):
+             # Handle plain string content if the structure differs
+             text_content = message.content
+             # Citations might be handled differently here, potentially needing parsing
+             # or might be absent if not directly annotated in string content.
+
     return {"text": text_content, "citations": citations}
 
 def propose_next_query(history_snippets: List[str]) -> str:
@@ -68,12 +91,15 @@ def propose_next_query(history_snippets: List[str]) -> str:
     Proposes a follow‑up search query given the latest research snippets.
     The prompt asks for a single concise query or "STOP" if no further search is needed.
     """
+    # Join the history snippets outside the f-string
+    recent_notes = "\n\n---\n\n".join(history_snippets[-3:])
+
     prompt = f"""
 You are building a research dossier on the topic: "{INITIAL_QUESTION}".
 
 Below are recent research notes (each ≤500 words):
 
-{"\n\n---\n\n".join(history_snippets[-3:])}
+{recent_notes}
 
 Based on the above, propose ONE concise follow‑up web search query (with no commentary)
 that would fill an important knowledge gap. If no further search is needed, reply "STOP".
@@ -84,6 +110,7 @@ that would fill an important knowledge gap. If no further search is needed, repl
         max_tokens=64,
         temperature=0.2,
     )
+    time.sleep(21) # Add delay for rate limiting (approx. 3 RPM)
     return response.choices[0].message.content.strip()
 
 def hierarchical_reduce(chunks: List[str]) -> str:
@@ -108,7 +135,7 @@ def hierarchical_reduce(chunks: List[str]) -> str:
             )
             summary = summary_response.choices[0].message.content
             new_chunks.append(summary)
-            time.sleep(0.5)  # To be gentle with the rate limits
+            time.sleep(21)  # Replace 0.5s sleep with 21s for rate limiting
         chunks = new_chunks
         combined = "\n\n".join(chunks)
     return combined
@@ -139,7 +166,6 @@ def main():
         total_tokens += added_tokens
         print(f"Round {round_number}: Added {added_tokens} tokens (total: {total_tokens})")
         round_number += 1
-        time.sleep(1.0)  # Pause between rounds
 
     # -------- Collapse Research Corpus to ≤32k Tokens --------
     print("\nReducing research corpus to meet the synthesis window limit (≤32k tokens)...")
